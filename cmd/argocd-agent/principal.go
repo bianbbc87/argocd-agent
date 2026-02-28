@@ -32,6 +32,7 @@ import (
 	"github.com/argoproj-labs/argocd-agent/internal/auth/userpass"
 	"github.com/argoproj-labs/argocd-agent/internal/config"
 	"github.com/argoproj-labs/argocd-agent/internal/env"
+	"github.com/argoproj-labs/argocd-agent/internal/grpcutil"
 	"github.com/argoproj-labs/argocd-agent/internal/kube"
 	"github.com/argoproj-labs/argocd-agent/internal/labels"
 	"github.com/argoproj-labs/argocd-agent/internal/tlsutil"
@@ -73,6 +74,7 @@ func NewPrincipalRunCommand() *cobra.Command {
 		autoNamespaceLabels       []string
 		enableWebSocket           bool
 		enableResourceProxy       bool
+		resourceProxyAddress      string
 		pprofPort                 int
 		resourceProxySecretName   string
 		resourceProxyCertPath     string
@@ -94,9 +96,16 @@ func NewPrincipalRunCommand() *cobra.Command {
 		redisCompressionType string
 		healthzPort          int
 
+		maxGRPCMessageSize int
+
 		// OpenTelemetry configuration
 		otlpAddress  string
 		otlpInsecure bool
+
+		destinationBasedMapping bool
+
+		enableSelfClusterRegistration bool
+		selfRegClientCertSecretName   string
 	)
 	command := &cobra.Command{
 		Use:   "principal",
@@ -200,7 +209,7 @@ func NewPrincipalRunCommand() *cobra.Command {
 					opts = append(opts, principal.WithTLSRootCaFromFile(rootCaPath))
 				} else {
 					logrus.Infof("Loading root CA certificate from secret %s/%s", namespace, rootCaSecretName)
-					opts = append(opts, principal.WithTLSRootCaFromSecret(kubeConfig.Clientset, namespace, rootCaSecretName, "tls.crt"))
+					opts = append(opts, principal.WithTLSRootCaFromSecret(kubeConfig.Clientset, namespace, rootCaSecretName, "tls.crt", "ca.crt"))
 				}
 			}
 
@@ -233,9 +242,16 @@ func NewPrincipalRunCommand() *cobra.Command {
 					proxyTLS, err = getResourceProxyTLSConfigFromKube(kubeConfig, namespace, resourceProxySecretName, resourceProxyCaSecretName)
 				}
 				if err != nil {
-					cmdutil.Fatal("Error reading TLS config for resource proxy: %v", err)
+					cmdutil.Fatal("Could not load resource proxy TLS configuration: %v", err)
+				}
+				if proxyTLS == nil {
+					cmdutil.Fatal("Could not load resource proxy TLS configuration: result is nil")
+				}
+				if err := tlsutil.SetTLSConfigFromFlags(proxyTLS, tlsMinVersion, tlsMaxVersion, tlsCipherSuites); err != nil {
+					cmdutil.Fatal("Could not set TLS configuration for resource proxy: %v", err)
 				}
 				opts = append(opts, principal.WithResourceProxyTLS(proxyTLS))
+				opts = append(opts, principal.WithResourceProxyAddress(resourceProxyAddress))
 			}
 
 			if jwtKey != "" {
@@ -262,14 +278,16 @@ func NewPrincipalRunCommand() *cobra.Command {
 
 			switch authMethod {
 			case "mtls":
+				source, regexStr := parseMTLSConfig(authConfig)
 				var regex *regexp.Regexp
-				if authConfig != "" {
-					regex, err = regexp.Compile(authConfig)
+				if regexStr != "" {
+					regex, err = regexp.Compile(regexStr)
 					if err != nil {
 						cmdutil.Fatal("Error compiling mtls agent id regex: %v", err)
 					}
 				}
-				mtlsauth := mtls.NewMTLSAuthentication(regex)
+				mtlsauth := mtls.NewMTLSAuthentication(regex, source)
+				logrus.Infof("Using mTLS authentication (source: %s, pattern: %s)", source, regexStr)
 				err := authMethods.RegisterMethod("mtls", mtlsauth)
 				if err != nil {
 					cmdutil.Fatal("Could not register mtls auth method: %v", err)
@@ -321,6 +339,22 @@ func NewPrincipalRunCommand() *cobra.Command {
 			opts = append(opts, principal.WithKeepAliveMinimumInterval(keepAliveMinimumInterval))
 			opts = append(opts, principal.WithRedis(redisAddress, redisPassword, redisCompressionType))
 			opts = append(opts, principal.WithHealthzPort(healthzPort))
+			opts = append(opts, principal.WithDestinationBasedMapping(destinationBasedMapping))
+			opts = append(opts, principal.WithMaxGRPCMessageSize(maxGRPCMessageSize))
+
+			// Self agent registration validation and options
+			if enableSelfClusterRegistration {
+				if selfRegClientCertSecretName == "" {
+					cmdutil.Fatal("Self agent registration requires --self-registration-client-cert-secret to be set")
+				}
+				if !enableResourceProxy {
+					cmdutil.Fatal("Self agent registration requires --enable-resource-proxy to be enabled")
+				}
+			}
+			opts = append(opts, principal.WithAgentRegistration(enableSelfClusterRegistration))
+			if selfRegClientCertSecretName != "" {
+				opts = append(opts, principal.WithClientCertSecretName(selfRegClientCertSecretName))
+			}
 
 			s, err := principal.NewServer(ctx, kubeConfig, namespace, opts...)
 			if err != nil {
@@ -443,6 +477,10 @@ func NewPrincipalRunCommand() *cobra.Command {
 	command.Flags().BoolVar(&enableResourceProxy, "enable-resource-proxy",
 		env.BoolWithDefault("ARGOCD_PRINCIPAL_ENABLE_RESOURCE_PROXY", true),
 		"Whether to enable the resource proxy")
+	command.Flags().StringVar(&resourceProxyAddress, "resource-proxy-address",
+		env.StringWithDefault("ARGOCD_PRINCIPAL_RESOURCE_PROXY_ADDRESS", nil, "argocd-agent-resource-proxy:9090"),
+		"Resource proxy address on principal side")
+
 	command.Flags().DurationVar(&keepAliveMinimumInterval, "keepalive-min-interval",
 		env.DurationWithDefault("ARGOCD_PRINCIPAL_KEEP_ALIVE_MIN_INTERVAL", nil, 0),
 		"Drop agent connections that send keepalive pings more often than the specified interval") // It should be less than "keep-alive-ping-interval" of agent
@@ -464,6 +502,10 @@ func NewPrincipalRunCommand() *cobra.Command {
 		env.NumWithDefault("ARGOCD_PRINCIPAL_HEALTH_CHECK_PORT", cmdutil.ValidPort, 8003),
 		"Port the health check server will listen on")
 
+	command.Flags().IntVar(&maxGRPCMessageSize, "grpc-max-message-size",
+		env.NumWithDefault("ARGOCD_PRINCIPAL_GRPC_MAX_MESSAGE_SIZE", nil, grpcutil.DefaultGRPCMaxMessageSize),
+		"Maximum gRPC message size in bytes for send and receive (default: 200MB)")
+
 	command.Flags().StringVar(&otlpAddress, "otlp-address",
 		env.StringWithDefault("ARGOCD_PRINCIPAL_OTLP_ADDRESS", nil, ""),
 		"Experimental: OpenTelemetry collector address for sending traces (e.g., localhost:4317)")
@@ -471,8 +513,19 @@ func NewPrincipalRunCommand() *cobra.Command {
 		env.BoolWithDefault("ARGOCD_PRINCIPAL_OTLP_INSECURE", false),
 		"Experimental: Use insecure connection to OpenTelemetry collector endpoint")
 
+	command.Flags().BoolVar(&destinationBasedMapping, "destination-based-mapping",
+		env.BoolWithDefault("ARGOCD_PRINCIPAL_DESTINATION_BASED_MAPPING", false),
+		"Map applications to agents based on spec.destination.name instead of namespace")
+
 	command.Flags().StringVar(&kubeConfig, "kubeconfig", "", "Path to a kubeconfig file to use")
 	command.Flags().StringVar(&kubeContext, "kubecontext", "", "Override the default kube context")
+
+	command.Flags().BoolVar(&enableSelfClusterRegistration, "enable-self-cluster-registration",
+		env.BoolWithDefault("ARGOCD_PRINCIPAL_ENABLE_SELF_CLUSTER_REGISTRATION", false),
+		"Allow agents with valid credentials to self-register on connection (requires --self-registration-client-cert-secret)")
+	command.Flags().StringVar(&selfRegClientCertSecretName, "self-registration-client-cert-secret",
+		env.StringWithDefault("ARGOCD_PRINCIPAL_SELF_REGISTRATION_CLIENT_CERT_SECRET", nil, ""),
+		"TLS secret containing shared client cert for self-registered cluster secrets (must have tls.crt, tls.key, ca.crt)")
 
 	return command
 }
@@ -506,7 +559,7 @@ func getResourceProxyTLSConfigFromKube(kubeClient *kube.KubernetesClient, namesp
 		return nil, fmt.Errorf("error getting proxy certificate: %w", err)
 	}
 
-	clientCA, err := tlsutil.X509CertPoolFromSecret(ctx, kubeClient.Clientset, namespace, caName, "tls.crt")
+	clientCA, err := tlsutil.X509CertPoolFromSecret(ctx, kubeClient.Clientset, namespace, caName, "tls.crt", "ca.crt")
 	if err != nil {
 		return nil, fmt.Errorf("error getting client CA certificate: %w", err)
 	}
@@ -591,6 +644,24 @@ func parseHeaderAuth(config string) (string, *regexp.Regexp, error) {
 	}
 
 	return headerName, extractionRegex, nil
+}
+
+// parseMTLSConfig parses mTLS configuration in the format:
+//
+//	<regex>              -> source=subject (deprecated, logs warning)
+//	subject:<regex>      -> source=subject
+//	uri:<regex>          -> source=uri
+//
+// Example: "uri:spiffe://ea1t\\.us\\.a/ns/argocd-agent/sa/(.+)"
+func parseMTLSConfig(config string) (mtls.IdentitySource, string) {
+	if strings.HasPrefix(config, "subject:") {
+		return mtls.IdentitySourceSubject, strings.TrimPrefix(config, "subject:")
+	}
+	if strings.HasPrefix(config, "uri:") {
+		return mtls.IdentitySourceURI, strings.TrimPrefix(config, "uri:")
+	}
+	logrus.Warn("DEPRECATED: mTLS auth config without explicit source (subject: or uri:). Please update to use 'mtls:subject:<regex>' or 'mtls:uri:<regex>'")
+	return mtls.IdentitySourceSubject, config
 }
 
 // validateAuthTLSPairing validates that the authentication method is compatible

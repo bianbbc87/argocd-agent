@@ -25,8 +25,10 @@ import (
 	"time"
 
 	"github.com/argoproj-labs/argocd-agent/internal/auth"
+	"github.com/argoproj-labs/argocd-agent/internal/grpcutil"
 	"github.com/argoproj-labs/argocd-agent/internal/logging"
 	"github.com/argoproj-labs/argocd-agent/internal/tlsutil"
+	"github.com/argoproj-labs/argocd-agent/internal/version"
 	"github.com/argoproj-labs/argocd-agent/pkg/api/grpc/authapi"
 	"github.com/argoproj-labs/argocd-agent/pkg/api/grpc/versionapi"
 	"github.com/argoproj-labs/argocd-agent/pkg/types"
@@ -91,6 +93,12 @@ type Remote struct {
 
 	// Time interval for agent to principal ping
 	keepAlivePingInterval time.Duration
+
+	// The largest GRPC message size supported, configurable via env/param
+	MaxGRPCMessageSize int
+
+	// agentVersion is the version of the agent, used for handshake validation
+	agentVersion string
 }
 
 type RemoteOption func(r *Remote) error
@@ -208,9 +216,9 @@ func WithRootAuthoritiesFromFile(caPath string) RemoteOption {
 // field. Otherwise, the ConfigMap is expected to contain one or more
 // certificates in each field of the ConfigMap, and all certificates will be
 // loaded into the certificate pool.
-func WithRootAuthoritiesFromSecret(kube kubernetes.Interface, namespace, name, field string) RemoteOption {
+func WithRootAuthoritiesFromSecret(kube kubernetes.Interface, namespace, name string, fields ...string) RemoteOption {
 	return func(r *Remote) error {
-		pool, err := tlsutil.X509CertPoolFromSecret(context.Background(), kube, namespace, name, field)
+		pool, err := tlsutil.X509CertPoolFromSecret(context.Background(), kube, namespace, name, fields...)
 		if err != nil {
 			return err
 		}
@@ -279,6 +287,18 @@ func WithCompression(flag bool) RemoteOption {
 	}
 }
 
+// WithMaxGRPCMessageSize configures the maximum gRPC message size (in bytes)
+// for both sending and receiving on the agent client connection.
+func WithMaxGRPCMessageSize(size int) RemoteOption {
+	return func(r *Remote) error {
+		if size <= 0 {
+			return fmt.Errorf("grpc max message size must be greater than 0")
+		}
+		r.MaxGRPCMessageSize = size
+		return nil
+	}
+}
+
 // WithMinimumTLSVersion configures the minimum TLS version the client will accept.
 func WithMinimumTLSVersion(version string) RemoteOption {
 	return func(r *Remote) error {
@@ -328,7 +348,9 @@ func NewRemote(hostname string, port int, opts ...RemoteOption) (*Remote, error)
 			Factor:   2,
 			Cap:      1 * time.Minute,
 		},
-		clientMode: types.AgentModeAutonomous,
+		clientMode:         types.AgentModeAutonomous,
+		MaxGRPCMessageSize: grpcutil.DefaultGRPCMaxMessageSize,
+		agentVersion:       version.New("argocd-agent").Version(),
 	}
 	for _, o := range opts {
 		if err := o(r); err != nil {
@@ -366,8 +388,11 @@ func (r *Remote) Creds() auth.Credentials {
 
 func (r *Remote) retriable(err error) bool {
 	st, ok := status.FromError(err)
-	if ok && st.Code() == codes.Canceled {
-		return false
+	if ok {
+		switch st.Code() {
+		case codes.Canceled, codes.FailedPrecondition, codes.InvalidArgument:
+			return false
+		}
 	}
 	return true
 }
@@ -413,11 +438,18 @@ func (r *Remote) Connect(ctx context.Context, forceReauth bool) error {
 
 	// Some default options
 	opts := []grpc.DialOption{
+		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(r.MaxGRPCMessageSize), grpc.MaxCallSendMsgSize(r.MaxGRPCMessageSize)),
 		grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
 		grpc.WithConnectParams(cparams),
 		grpc.WithUserAgent("argocd-agent/v0.0.1"),
-		grpc.WithUnaryInterceptor(r.unaryAuthInterceptor),
-		grpc.WithStreamInterceptor(r.streamAuthInterceptor),
+		grpc.WithChainUnaryInterceptor(
+			r.unaryAuthInterceptor,
+			grpcutil.UnaryClientMsgSizeInterceptor(r.MaxGRPCMessageSize),
+		),
+		grpc.WithChainStreamInterceptor(
+			r.streamAuthInterceptor,
+			grpcutil.StreamClientMsgSizeInterceptor(r.MaxGRPCMessageSize),
+		),
 	}
 
 	if r.enableCompression {
@@ -478,11 +510,23 @@ func (r *Remote) Connect(ctx context.Context, forceReauth bool) error {
 		case <-ctx.Done():
 			return status.Error(codes.Canceled, "context canceled")
 		default:
-			resp, ierr := authC.Authenticate(ctx, &authapi.AuthRequest{Method: r.authMethod, Credentials: r.creds, Mode: r.clientMode.String()})
+			resp, ierr := authC.Authenticate(ctx, &authapi.AuthRequest{Method: r.authMethod, Credentials: r.creds, Mode: r.clientMode.String(), Version: r.agentVersion})
 			if ierr != nil {
+				st, ok := status.FromError(ierr)
+				if ok {
+					if st.Code() == codes.FailedPrecondition {
+						log().Errorf("Version mismatch with principal: %v", st.Message())
+						return ierr // preserve gRPC status for retriable() check
+					}
+					if st.Code() == codes.InvalidArgument {
+						log().Errorf("Agent version validation failed: %v", st.Message())
+						return ierr // preserve gRPC status for retriable() check
+					}
+				}
 				logrus.Warnf("Auth failure: %v (retrying in %v)", ierr, cBackoff.Step())
 				return ierr
 			}
+
 			r.accessToken, ierr = NewToken(resp.AccessToken)
 			if ierr != nil {
 				logrus.Warnf("Auth failure: %v (retrying in %v)", ierr, cBackoff.Step())

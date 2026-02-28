@@ -24,7 +24,9 @@ import (
 	"github.com/argoproj-labs/argocd-agent/internal/issuer"
 	"github.com/argoproj-labs/argocd-agent/internal/logging"
 	"github.com/argoproj-labs/argocd-agent/internal/queue"
+	"github.com/argoproj-labs/argocd-agent/internal/version"
 	"github.com/argoproj-labs/argocd-agent/pkg/api/grpc/authapi"
+	"github.com/argoproj-labs/argocd-agent/principal/registration"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -36,6 +38,11 @@ type Server struct {
 	issuer      issuer.Issuer
 	options     *ServerOptions
 	queues      *queue.SendRecvQueues
+
+	agentRegistrationManager *registration.AgentRegistrationManager
+
+	// principalVersion is the version of the principal, used for handshake validation
+	principalVersion string
 }
 
 const (
@@ -50,7 +57,9 @@ const (
 
 var errAuthenticationFailed = status.Error(codes.Unauthenticated, authFailedMessage)
 
-type ServerOptions struct{}
+type ServerOptions struct {
+	agentRegistrationManager *registration.AgentRegistrationManager
+}
 
 type ServerOption func(o *ServerOptions) error
 
@@ -72,6 +81,9 @@ func NewServer(queues *queue.SendRecvQueues, authMethods *auth.Methods, iss issu
 			return nil, err
 		}
 	}
+
+	s.agentRegistrationManager = s.options.agentRegistrationManager
+	s.principalVersion = version.New("argocd-agent").Version()
 	return s, nil
 }
 
@@ -98,8 +110,13 @@ func (s *Server) issueTokens(subject *auth.AuthSubject, refresh bool) (accessTok
 //
 // A Server may support one or more authentication methods, and if the authz
 // request succeeds, a JWT will be issued to the client.
+//
+// This method also performs version handshake validation. The agent must send
+// its version number, and if it doesn't match the principal's version exactly,
+// the authentication will be rejected.
 func (s *Server) Authenticate(ctx context.Context, ar *authapi.AuthRequest) (*authapi.AuthResponse, error) {
 	logCtx := log().WithField("method", "Authenticate").WithField("authmethod", ar.Method)
+
 	switch ar.Mode {
 	case "managed", "autonomous":
 		break
@@ -116,6 +133,29 @@ func (s *Server) Authenticate(ctx context.Context, ar *authapi.AuthRequest) (*au
 		logCtx.WithError(err).WithField("client", clientID).Info("client authentication failed")
 		return nil, errAuthenticationFailed
 	}
+
+	agentVersion := ar.Version
+
+	if agentVersion == "" {
+		logCtx.Warn("Agent did not provide version information")
+		return nil, status.Error(codes.InvalidArgument, "agent version is required")
+	}
+
+	if agentVersion != s.principalVersion {
+		logCtx.Warnf("Version mismatch: rejecting connection (agent: %s, principal: %s)", agentVersion, s.principalVersion)
+		return nil, status.Errorf(codes.FailedPrecondition, "version mismatch")
+	}
+
+	logCtx.WithField("client", clientID).WithField("agent_version", agentVersion).Info("client authentication successful")
+
+	// If self agent registration is enabled, register the agent and create cluster secret if it doesn't exist
+	if s.agentRegistrationManager != nil && s.agentRegistrationManager.IsSelfAgentRegistrationEnabled() {
+		if err := s.agentRegistrationManager.RegisterAgent(ctx, clientID); err != nil {
+			logCtx.WithError(err).WithField("client", clientID).Error("Failed to register agent")
+			return nil, errAuthenticationFailed
+		}
+	}
+
 	subject := &auth.AuthSubject{ClientID: clientID, Mode: ar.Mode}
 	accessToken, refreshToken, err := s.issueTokens(subject, true)
 	if err != nil {
@@ -131,6 +171,7 @@ func (s *Server) Authenticate(ctx context.Context, ar *authapi.AuthRequest) (*au
 	return &authapi.AuthResponse{
 		AccessToken:  accessToken,
 		RefreshToken: refreshToken,
+		Version:      s.principalVersion,
 	}, nil
 }
 

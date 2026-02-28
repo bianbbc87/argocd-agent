@@ -169,8 +169,14 @@ func (a *Agent) handleStreamEvents() error {
 		return err
 	}
 
-	a.eventWriter = event.NewEventWriter(stream)
-	go a.eventWriter.SendWaitingEvents(a.context)
+	if a.eventWriter != nil {
+		// Reuse the existing event writer if it exists.
+		a.eventWriter.UpdateTarget(stream)
+	} else {
+		// Create a new event writer if it doesn't exist.
+		a.eventWriter = event.NewEventWriter(stream)
+		go a.eventWriter.SendWaitingEvents(a.context)
+	}
 
 	logCtx := log().WithFields(logrus.Fields{
 		logfields.Module:     "StreamEvent",
@@ -305,7 +311,8 @@ func (a *Agent) resyncOnStart(logCtx *logrus.Entry) error {
 			return err
 		}
 
-		resyncHandler := resync.NewRequestHandler(dynClient, sendQ, a.emitter, a.resources, logCtx, manager.ManagerRoleAgent, a.namespace)
+		resyncHandler := resync.NewRequestHandler(dynClient, sendQ, a.emitter, a.resources, logCtx, manager.ManagerRoleAgent, a.namespace).
+			WithDestinationBasedMapping(a.destinationBasedMapping)
 		go resyncHandler.SendRequestUpdates(a.context)
 
 		// Agent should request SyncedResourceList from the principal to detect deleted

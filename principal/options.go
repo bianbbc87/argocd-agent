@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"github.com/argoproj-labs/argocd-agent/internal/auth"
+	"github.com/argoproj-labs/argocd-agent/internal/grpcutil"
 	"github.com/argoproj-labs/argocd-agent/internal/logging"
 	"github.com/argoproj-labs/argocd-agent/internal/tlsutil"
 	cacheutil "github.com/argoproj/argo-cd/v3/util/cache"
@@ -71,6 +72,7 @@ type ServerOptions struct {
 	healthzPort            int
 	redisProxyDisabled     bool
 	informerSyncTimeout    time.Duration
+	maxGRPCMessageSize     int
 
 	// insecurePlaintext disables TLS on the gRPC server. Use when Istio sidecar
 	// handles mTLS termination.
@@ -80,6 +82,14 @@ type ServerOptions struct {
 	redisProxyLogger    *logging.CentralizedLogger
 	resourceProxyLogger *logging.CentralizedLogger
 	grpcEventLogger     *logging.CentralizedLogger
+
+	// destinationBasedMapping enables mapping applications to agents based on
+	// spec.destination.name instead of the application's namespace
+	destinationBasedMapping bool
+
+	selfAgentRegistrationEnabled bool
+	resourceProxyAddress         string
+	clientCertSecretName         string
 }
 
 type ServerOption func(o *Server) error
@@ -87,13 +97,15 @@ type ServerOption func(o *Server) error
 // defaultOptions returns a set of default options for the server
 func defaultOptions() *ServerOptions {
 	return &ServerOptions{
-		port:                443,
-		address:             "",
-		tlsMinVersion:       tls.VersionTLS13,
-		unauthMethods:       make(map[string]bool),
-		eventProcessors:     10,
-		rootCa:              x509.NewCertPool(),
-		informerSyncTimeout: 60 * time.Second,
+		port:                 443,
+		address:              "",
+		tlsMinVersion:        tls.VersionTLS13,
+		unauthMethods:        make(map[string]bool),
+		eventProcessors:      10,
+		rootCa:               x509.NewCertPool(),
+		informerSyncTimeout:  60 * time.Second,
+		maxGRPCMessageSize:   grpcutil.DefaultGRPCMaxMessageSize,
+		resourceProxyAddress: "argocd-agent-resource-proxy:9090",
 	}
 }
 
@@ -221,9 +233,9 @@ func WithTLSRootCaFromFile(caPath string) ServerOption {
 // If field is non-empty, only loads certificates stored in the named field.
 // Otherwise, if field is empty, loads certificates from all fields in the
 // Secret.
-func WithTLSRootCaFromSecret(kube kubernetes.Interface, namespace, name, field string) ServerOption {
+func WithTLSRootCaFromSecret(kube kubernetes.Interface, namespace, name string, fields ...string) ServerOption {
 	return func(o *Server) error {
-		pool, err := tlsutil.X509CertPoolFromSecret(context.Background(), kube, namespace, name, field)
+		pool, err := tlsutil.X509CertPoolFromSecret(context.Background(), kube, namespace, name, fields...)
 		if err != nil {
 			return err
 		}
@@ -495,6 +507,18 @@ func WithHealthzPort(port int) ServerOption {
 	}
 }
 
+// WithMaxGRPCMessageSize configures the maximum gRPC message size (in bytes)
+// for both sending and receiving on the principal server.
+func WithMaxGRPCMessageSize(size int) ServerOption {
+	return func(o *Server) error {
+		if size <= 0 {
+			return fmt.Errorf("grpc max message size must be greater than 0")
+		}
+		o.options.maxGRPCMessageSize = size
+		return nil
+	}
+}
+
 // WithInsecurePlaintext disables TLS on the gRPC server. This should only be
 // used when running behind a service mesh (e.g., Istio) that handles mTLS
 // termination at the sidecar level.
@@ -527,6 +551,38 @@ func WithSubsystemLoggers(resourceProxy, redisProxy, grpcEvent *logrus.Logger) S
 		} else {
 			o.options.grpcEventLogger = logging.GetDefaultLogger()
 		}
+		return nil
+	}
+}
+
+// WithDestinationBasedMapping enables destination-based mapping for applications.
+// When enabled, applications are mapped to agents based on spec.destination.name
+// instead of the application's namespace. This allows applications to exist in
+// any namespace on the principal while still being routed to the correct agent.
+func WithDestinationBasedMapping(enabled bool) ServerOption {
+	return func(o *Server) error {
+		o.options.destinationBasedMapping = enabled
+		return nil
+	}
+}
+
+func WithAgentRegistration(enabled bool) ServerOption {
+	return func(o *Server) error {
+		o.options.selfAgentRegistrationEnabled = enabled
+		return nil
+	}
+}
+
+func WithResourceProxyAddress(address string) ServerOption {
+	return func(o *Server) error {
+		o.options.resourceProxyAddress = address
+		return nil
+	}
+}
+
+func WithClientCertSecretName(name string) ServerOption {
+	return func(o *Server) error {
+		o.options.clientCertSecretName = name
 		return nil
 	}
 }

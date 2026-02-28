@@ -37,7 +37,7 @@ SVC CIDR: 10.97.0.0/12         SVC CIDR: 10.98.0.0/12...
 │ │ │ Repository  │ │ │       ││ │ │ Controller  │ │ │
 │ │ │ Redis       │ │ │       ││ │ │ Repository  │ │ │
 │ │ │ Dex (SSO)   │ │ │       ││ │ │ Redis       │ │ │
-│ │ └─────────────┘ │ │       ││ │ └─────────────┘ │
+│ │ └─────────────┘ │ │       ││ │ └─────────────┘ │ │
 │ └─────────────────┘ │       ││ └─────────────────┘ │
 │ ┌─────────────────┐ │       ││ ┌─────────────────┐ │
 │ │   Principal     │ │◄──────┘│ │     Agent       │ │
@@ -86,11 +86,8 @@ echo "Agent Service CIDR: $AGENT_SVC_CIDR"
 
 ### Set Release Version Environment Value
 You can check available release branches directly from the GitHub repository: [branches](https://github.com/argoproj-labs/argocd-agent/branches)
-The latest available release branch as of now is **release-0.4**.
-
 ```bash
-# === Define resource names ===
-export RELEASE_BRANCH="release-0.4"
+export RELEASE_BRANCH="main"
 
 # (optional) Check variables
 echo "Release Branch: $RELEASE_BRANCH"
@@ -347,10 +344,27 @@ This configuration includes:
 - ✅ **argocd-redis** (local state for the application controller)
 - ❌ **argocd-server** (runs on control plane only)
 - ❌ **argocd-dex-server** (runs on control plane only)
-- ❌ **argocd-applicationset-controller** (managed agents don't create their own ApplicationSets)
+- ❌ **argocd-applicationset-controller** (not included by default)
 
 !!! info "Why Application Controller Runs Here"
     The **argocd-application-controller** runs on workload clusters because it needs direct access to the Kubernetes API to create, update, and delete resources. The argocd-agent facilitates communication between the control plane and these controllers, enabling centralized management while maintaining local execution.
+
+### (Optional) Install Argo CD for Workload Cluster with ApplicationSet (Autonomous mode only)
+
+**Instead of the standard install above**, use the following command with `--server-side=true` (required due to the large ApplicationSet CRD):
+
+```bash
+kubectl apply -n $NAMESPACE_NAME --server-side=true \
+  -k "https://github.com/argoproj-labs/argocd-agent/install/kubernetes/argo-cd/agent-autonomous-appset?ref=$RELEASE_BRANCH" \
+  --context kind-$AGENT_CLUSTER_NAME
+```
+
+This configuration includes everything from the standard install, plus:
+
+- ✅ **argocd-applicationset-controller** (generates Applications from ApplicationSet templates)
+
+!!! info "Why ApplicationSet Controller Runs Here"
+    The **argocd-applicationset-controller** runs on workload clusters because it allows the cluster to generate Applications dynamically using ApplicationSet generators such as list, git, and cluster, enables autonomous mode with template-based application creation, and provides a way to manage multiple similar applications from a single ApplicationSet definition.
 
 ### Create Agent configuration
 Create Agent configuration on Principal. <br />
@@ -363,9 +377,7 @@ echo "<principal-external-ip>: $PRINCIPAL_EXTERNAL_IP"
 argocd-agentctl agent create $AGENT_APP_NAME \
   --principal-context kind-$PRINCIPAL_CLUSTER_NAME \
   --principal-namespace $NAMESPACE_NAME \
-  --resource-proxy-server ${PRINCIPAL_EXTERNAL_IP}:9090 \
-  --resource-proxy-username $AGENT_APP_NAME \
-  --resource-proxy-password "$(openssl rand -base64 32)"
+  --resource-proxy-server ${PRINCIPAL_EXTERNAL_IP}:9090
 ```
 
 ### Issue Agent client certificate
@@ -572,7 +584,7 @@ echo "Agent Service CIDR: $AGENT_SVC_CIDR"
 
 ### Common Issues
 
-**Access Fobidden**
+**Access Forbidden**
 ```bash
 # The application status contains:
 error="applications.argoproj.io \"<agent-app-name>\" is forbidden: 
@@ -602,7 +614,7 @@ kubectl get applications -n $NAMESPACE_NAME --context kind-$AGENT_CLUSTER_NAME
 ```
 
 
-**Missing Server Secretkey**:
+**Missing Server Secret Key**:
 ```bash
 # The application status contains:
 status:
